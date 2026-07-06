@@ -135,13 +135,14 @@ def derive_referer(url):
 
 
 def smart_get(s, url, **kw):
-    """带代理兜底的 GET：走系统代理失败则自动改为直连重试（整 session 生效）"""
+    """智能 GET：探测代理是否可用，不可用则自动切换直连（整 session 生效）"""
+    if not s.trust_env:
+        return s.get(url, **kw)
     try:
         return s.get(url, **kw)
     except requests.exceptions.ProxyError as e:
-        if s.trust_env:
-            log(f'  系统代理不可用，改用直连: {str(e)[:80]}')
-            s.trust_env = False  # 后续所有请求都不再走代理
+        log(f'  代理不可达（{str(e)[:60]}），关闭代理改用直连')
+        s.trust_env = False
         return s.get(url, **kw)
 
 
