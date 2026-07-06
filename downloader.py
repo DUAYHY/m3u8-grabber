@@ -123,6 +123,21 @@ def _parse_url_token(url):
     return None, None
 
 
+def detect_proxy():
+    """扫描常见代理端口，返回代理地址或 None"""
+    import socket
+    for port in (7897, 7890, 10809, 1080, 8080):
+        try:
+            s = socket.create_connection(('127.0.0.1', port), timeout=0.5)
+            s.close()
+            log(f'检测到代理: http://127.0.0.1:{port}')
+            return f'http://127.0.0.1:{port}'
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            continue
+    log('未检测到代理，使用直连')
+    return None
+
+
 def derive_referer(url):
     """从地址 origin 推导兜底 Referer"""
     try:
@@ -521,6 +536,12 @@ def main():
     if not ffmpeg:
         log('未找到 ffmpeg.exe，请放到本目录下')
         sys.exit(1)
+
+    # 自动检测代理，有则设为环境变量
+    proxy = detect_proxy()
+    if proxy:
+        os.environ['HTTPS_PROXY'] = proxy
+        os.environ['HTTP_PROXY'] = proxy
 
     server = HTTPServer(('127.0.0.1', PORT), Handler)
 
