@@ -31,7 +31,7 @@ if _missing:
 # ============================================================
 import os, time, shutil, subprocess, binascii, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlparse, parse_qs
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
@@ -107,6 +107,22 @@ def find_ffmpeg():
     return None
 
 
+def _parse_url_token(url):
+    """从 URL 参数中提取 token 过期时间，返回 (expiry_ts, 人类可读时间)"""
+    params = parse_qs(urlparse(url).query)
+    for key in ('expires', 'expire', 'deadline', 'exp', 't', 'timestamp', 'ts', 'etime', 'end'):
+        vals = params.get(key, [])
+        if vals:
+            try:
+                ts = int(vals[0])
+                if ts > 1000000000:  # 秒级时间戳
+                    dt_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+                    return ts, dt_str
+            except (ValueError, OSError):
+                pass
+    return None, None
+
+
 def derive_referer(url):
     """从地址 origin 推导兜底 Referer"""
     try:
@@ -172,12 +188,54 @@ def download_one(name, m3u8_url, referer=None):
     if ref:
         log(f'  Referer: {ref[:80]}')
 
+    # --- Token 过期预检 ---
+    exp_ts, exp_str = _parse_url_token(m3u8_url)
+    if exp_ts:
+        now_ts = int(time.time())
+        if exp_ts < now_ts:
+            log(f'  ⚠ Token 已过期！过期时间: {exp_str} (已过 {now_ts - exp_ts} 秒)')
+        else:
+            remain = exp_ts - now_ts
+            log(f'  Token 有效，过期时间: {exp_str} (剩余 {remain}s ≈ {remain/60:.0f}min)')
+
     # 1. 下载并解析 M3U8（自动处理 master playlist）
     log('  [1/4] 下载索引...', end=' ')
     try:
         m3u8, base = fetch_playlist(s, m3u8_url)
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if hasattr(e, 'response') and e.response else 0
+        body = (e.response.text or '')[:200] if hasattr(e, 'response') and e.response else ''
+        log(f'  HTTP {code}')
+        if code == 403:
+            log(f'  ┌ 403 可能原因:')
+            log(f'  │ 1. 链接中的 token 已过期（通常有时效）')
+            log(f'  │ 2. Referer 不匹配 CDN 防盗链白名单')
+            log(f'  │ 3. 请求 IP 与 token 签发时的 IP 不一致')
+            log(f'  └ 建议: 刷新页面后重新嗅探 m3u8 地址再发送')
+            if body: log(f'  响应: {body[:200]}')
+        elif code == 404:
+            log(f'  ┌ 404: M3U8 文件已被 CDN 移除，链接已失效')
+            log(f'  └ 建议: 刷新页面重新嗅探')
+        elif code == 401:
+            log(f'  ┌ 401: 需要认证，token 可能已过期')
+            log(f'  └ 建议: 刷新页面重新嗅探')
+        elif code >= 500:
+            log(f'  CDN 服务器错误，可稍后重试')
+        else:
+            if body: log(f'  响应: {body[:200]}')
+        return False
+    except requests.exceptions.ProxyError as e:
+        log(f'  代理连接错误: {str(e)[:100]}')
+        log(f'  系统代理不可用，尝试运行 启动.bat 或关闭系统代理后重试')
+        return False
+    except requests.exceptions.ConnectionError as e:
+        log(f'  无法连接: DNS 解析失败或网络不通 ({str(e)[:100]})')
+        return False
+    except requests.exceptions.Timeout:
+        log(f'  连接超时 (30s)，CDN 节点不可达，检查网络或稍后重试')
+        return False
     except Exception as e:
-        log(f'失败: {e}')
+        log(f'  失败: {e}')
         return False
 
     # 2. 解析
@@ -187,11 +245,11 @@ def download_one(name, m3u8_url, referer=None):
     explicit_iv = False
     for line in m3u8.split('\n'):
         line = line.strip()
-        if line.startswith('#EXT-X-KEY'):
-            if 'AES-128' in line and 'URI=' in line:
-                a = line.find('URI="') + 5
-                b = line.find('"', a)
-                key_url = line[a:b]
+        if '#EXT-X-KEY' in line and 'URI=' in line:
+            # 兼容 URI="..." 和 URI=... 两种格式
+            uri_match = re.search(r'URI="?([^",]+)"?', line)
+            if uri_match:
+                key_url = uri_match.group(1)
                 if not key_url.startswith('http'):
                     key_url = urljoin(base, key_url)
                 iv_s = line.find('IV=0x')
@@ -201,16 +259,61 @@ def download_one(name, m3u8_url, referer=None):
                 else:
                     iv = None
                     explicit_iv = False
-            elif 'METHOD=NONE' in line.upper():
+            if 'METHOD=NONE' in line.upper():
                 key_url = None
-            else:
+            elif 'AES-128' not in line:
                 m = re.search(r'METHOD=([A-Z0-9-]+)', line)
-                log(f'  ⚠ 不支持的加密: {m.group(1) if m else line[:50]}（可能解密失败）')
+                if m:
+                    log(f'  ⚠ 不支持的加密方法: {m.group(1)}')
         elif line and not line.startswith('#'):
             u = line if line.startswith('http') else urljoin(base, line)
             segments.append(u)
 
     log(f'{len(segments)} 片段')
+    if key_url:
+        log(f'  加密: AES-128 | 密钥: {key_url[:100]}')
+    else:
+        log(f'  加密: 无（明文 TS）')
+    if segments:
+        log(f'  首分片: {segments[0][:120]}')
+
+    # --- 2.5 嵌套 M3U8 检测 ---
+    if len(segments) <= 2:
+        log('  [2.5] 检测嵌套索引...', end=' ')
+        if not segments:
+            log('M3U8 中无 TS 片段')
+        else:
+            try:
+                probe = smart_get(s, segments[0], timeout=30).content
+                if probe.strip()[:20].startswith(b'#EXTM3U'):
+                    log('发现嵌套 M3U8，展开中...')
+                    inner_text = probe.decode('utf-8', errors='replace')
+                    inner_base = '/'.join(segments[0].split('/')[:-1]) + '/'
+                    new_segs, new_key = [], None
+                    new_iv, new_exp = None, False
+                    for iline in inner_text.split('\n'):
+                        iline = iline.strip()
+                        if '#EXT-X-KEY' in iline and 'URI=' in iline:
+                            um = re.search(r'URI="?([^",]+)"?', iline)
+                            if um:
+                                new_key = um.group(1)
+                                if not new_key.startswith('http'):
+                                    new_key = urljoin(inner_base, new_key)
+                                iv_s2 = iline.find('IV=0x')
+                                if iv_s2 != -1:
+                                    new_iv = binascii.unhexlify(iline[iv_s2 + 5:iv_s2 + 37])
+                                    new_exp = True
+                        elif iline and not iline.startswith('#'):
+                            u = iline if iline.startswith('http') else urljoin(inner_base, iline)
+                            new_segs.append(u)
+                    if new_segs:
+                        segments, key_url = new_segs, new_key
+                        iv, explicit_iv = new_iv, new_exp
+                        log(f'{len(segments)} 个真实片段' + (' [加密]' if new_key else ' [明文]'))
+                else:
+                    log('非嵌套（直接 TS 片段）')
+            except Exception as e:
+                log(f'检测跳过 ({e})')
 
     encrypted = key_url is not None
 
