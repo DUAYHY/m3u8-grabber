@@ -1,0 +1,20 @@
+# Python 运行环境（WinPython）
+WPy32-3830/
+WPy64-3830/
+
+# 下载输出
+downloads/*
+!downloads/.gitkeep
+
+# 日志
+*.log
+
+# ffmpeg 太大，建议用户自己放
+ffmpeg.exe
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# IDE
+.claude/

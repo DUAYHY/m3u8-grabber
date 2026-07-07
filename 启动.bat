@@ -13,6 +13,11 @@ pause
 exit /b 1
 
 :run
+REM Auto-kill old downloader process on port 8910
+for /f "tokens=5" %%a in ('netstat -ano 2^>NUL ^| findstr ":8910 " ^| findstr "LISTENING"') do (
+    echo [INFO] Killing old downloader PID %%a ...
+    taskkill //F //PID %%a >NUL 2>&1
+)
 set PYTHONUNBUFFERED=1
 "%P%" -u downloader.py
 pause

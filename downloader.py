@@ -188,15 +188,92 @@ def fetch_playlist(s, m3u8_url, depth=0):
     return text, base
 
 
-def download_one(name, m3u8_url, referer=None):
+def _download_dash(name, video_url, audio_url, referer=None):
+    """DASH 下载：单个视频 m4s + 可选音频 m4s，ffmpeg 合并"""
+    s = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*', 'Accept-Language': 'zh-CN,zh;q=0.9',
+    }
+    if referer: headers['Referer'] = referer
+    s.headers.update(headers)
+
+    log(f'\n  {name} [DASH]')
+    log(f'  {"-" * 50}')
+    tmp = os.path.join(OUT, f'dash_{int(time.time())}')
+    os.makedirs(tmp, exist_ok=True)
+
+    # 下载视频
+    log('  下载视频...', end=' ')
+    try:
+        vdata = smart_get(s, video_url, timeout=120).content
+    except Exception as e:
+        log(f'失败: {e}')
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+    vfp = os.path.join(tmp, 'video.m4s')
+    with open(vfp, 'wb') as f: f.write(vdata)
+    log(f'{len(vdata)/1048576:.1f} MB')
+
+    # 下载音频
+    if audio_url:
+        log('  下载音频...', end=' ')
+        try:
+            adata = smart_get(s, audio_url, timeout=120).content
+        except Exception as e:
+            log(f'失败: {e}')
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        afp = os.path.join(tmp, 'audio.m4s')
+        with open(afp, 'wb') as f: f.write(adata)
+        log(f'{len(adata)/1048576:.1f} MB')
+
+    # 合并
+    output = os.path.join(OUT, f'{safe_name(name)}.mp4')
+    if audio_url:
+        cmd = [find_ffmpeg() or 'ffmpeg', '-i', vfp, '-i', afp, '-c', 'copy', '-movflags', '+faststart', '-y', output]
+    else:
+        cmd = [find_ffmpeg() or 'ffmpeg', '-i', vfp, '-c', 'copy', '-movflags', '+faststart', '-y', output]
+    r = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace', timeout=600)
+    if r.returncode != 0:
+        log(f'  无损合并失败: {(r.stderr or "")[-150:].strip()}，重编码...')
+        if audio_url:
+            cmd2 = [find_ffmpeg() or 'ffmpeg', '-i', vfp, '-i', afp, '-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart', '-y', output]
+        else:
+            cmd2 = [find_ffmpeg() or 'ffmpeg', '-i', vfp, '-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart', '-y', output]
+        subprocess.run(cmd2, capture_output=True, encoding='utf-8', errors='replace', timeout=600)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    if os.path.exists(output):
+        mb = os.path.getsize(output) / 1048576
+        log(f'  {mb:.1f} MB -> {output}')
+        return True
+    log('  合并失败')
+    return False
+
+
+def download_one(name, m3u8_url, referer=None, audio_url=None):
     """下载单个视频"""
+    # DASH 模式（B站 VOD）：单个 m4s + 可选音频
+    if audio_url or '.m4s' in m3u8_url.split('?')[0]:
+        return _download_dash(name, m3u8_url, audio_url, referer)
+
     s = requests.Session()
     ref = referer or derive_referer(m3u8_url)
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache',
     }
     if ref:
         headers['Referer'] = ref
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(ref)
+            headers['Origin'] = f'{p.scheme}://{p.netloc}'
+        except:
+            pass
     s.headers.update(headers)
 
     log(f'\n  {name}')
@@ -256,12 +333,19 @@ def download_one(name, m3u8_url, referer=None):
 
     # 2. 解析
     segments = []
+    init_segment = None  # fMP4 初始化段
     key_url = None
     iv = None
     explicit_iv = False
     for line in m3u8.split('\n'):
         line = line.strip()
-        if '#EXT-X-KEY' in line and 'URI=' in line:
+        if '#EXT-X-MAP:' in line:
+            um = re.search(r'URI="?([^",]+)"?', line)
+            if um:
+                iurl = um.group(1)
+                init_segment = iurl if iurl.startswith('http') else urljoin(base, iurl)
+                log(f'  fMP4 初始化段: {init_segment[:100]}')
+        elif '#EXT-X-KEY' in line and 'URI=' in line:
             # 兼容 URI="..." 和 URI=... 两种格式
             uri_match = re.search(r'URI="?([^",]+)"?', line)
             if uri_match:
@@ -350,6 +434,18 @@ def download_one(name, m3u8_url, referer=None):
     tmp = os.path.join(OUT, f'tmp_{int(time.time())}')
     os.makedirs(tmp, exist_ok=True)
 
+    # 下载 fMP4 初始化段（若有）
+    if init_segment:
+        try:
+            idata = smart_get(s, init_segment, timeout=30).content
+            ifp = os.path.join(tmp, 'init.mp4')
+            with open(ifp, 'wb') as f:
+                f.write(idata)
+            log(f'  初始化段: {len(idata)} 字节')
+        except Exception as e:
+            log(f'  初始化段下载失败: {e}')
+            init_segment = None
+
     def dl_one(url, idx):
         for _ in range(3):
             try:
@@ -397,9 +493,12 @@ def download_one(name, m3u8_url, referer=None):
     files = [results[i] for i in sorted(results)]
     output = os.path.join(OUT, f'{safe_name(name)}.mp4')
 
-    # Concat 列表
+    # Concat 列表（fMP4 初始化段排最前）
     lst = os.path.join(OUT, '_concat.txt')
     with open(lst, 'w', encoding='utf-8') as f:
+        if init_segment and os.path.exists(os.path.join(tmp, 'init.mp4')):
+            ffp = os.path.join(tmp, 'init.mp4').replace(os.sep, '/')
+            f.write(f"file '{ffp}'\n")
         for fp in files:
             f.write(f"file '{fp.replace(os.sep, '/')}'\n")
 
@@ -417,6 +516,9 @@ def download_one(name, m3u8_url, referer=None):
         # 重编码回退
         lst2 = os.path.join(OUT, '_concat2.txt')
         with open(lst2, 'w', encoding='utf-8') as f:
+            if init_segment and os.path.exists(os.path.join(tmp, 'init.mp4')):
+                ffp = os.path.join(tmp, 'init.mp4').replace(os.sep, '/')
+                f.write(f"file '{ffp}'\n")
             for fp in files:
                 f.write(f"file '{fp.replace(os.sep, '/')}'\n")
         cmd2 = [find_ffmpeg() or 'ffmpeg', '-f', 'concat', '-safe', '0',
@@ -454,6 +556,13 @@ count_lock = threading.Lock()
 # 线程池：支持同时下载最多3个
 download_pool = ThreadPoolExecutor(max_workers=3)
 
+# 直播录制状态
+live_stop_event = threading.Event()
+live_recording_active = False
+live_recording_count = 0
+live_recording_name = ''
+live_recording_start = 0
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -472,8 +581,30 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
-        global total_count
+        global total_count, live_recording_active, live_stop_event
         log(f'HTTP POST {self.path} 开始处理')
+
+        # 直播状态查询 / 停止
+        if self.path == '/live/status':
+            self._cors()
+            self._json({
+                'recording': live_recording_active,
+                'count': live_recording_count,
+                'elapsed': int(time.time()) - live_recording_start if live_recording_active else 0,
+            })
+            return
+
+        if self.path == '/live/stop':
+            self._cors()
+            if not live_recording_active:
+                self._json({'status': 'error', 'msg': 'no recording'})
+                return
+            log('>>> 停止录制')
+            live_stop_event.set()
+            self._json({'status': 'stopping', 'msg': '正在停止并合并...'})
+            return
+
+        # /send 逻辑（点播+直播共用）
         try:
             length = int(self.headers.get('Content-Length', 0))
             raw = self.rfile.read(length)
@@ -494,11 +625,25 @@ class Handler(BaseHTTPRequestHandler):
             log(f'>>> 收到任务: [{name}]')
             log(f'    URL: {url[:80]}...')
 
-            self._cors()
-            self._json({'status': 'accepted', 'msg': f'已接收: {name}'})
-            log(f'已响应 accepted，提交后台下载...')
-
-            download_pool.submit(self._do_download, name, url, referer)
+            # 检查是否直播模式
+            is_live = data.get('live', False)
+            if is_live:
+                if live_recording_active:
+                    self._cors()
+                    self._json({'status': 'error', 'msg': 'already recording'})
+                    return
+                live_recording_active = True
+                live_stop_event.clear()
+                self._cors()
+                self._json({'status': 'recording', 'msg': f'recording: {name}'})
+                log('已响应 recording，提交后台录制...')
+                download_pool.submit(self._record_live, name, url, referer)
+            else:
+                audio_url = data.get('audio_url', '') or ''
+                self._cors()
+                self._json({'status': 'accepted', 'msg': f'已接收: {name}'})
+                log(f'已响应 accepted，提交后台下载...')
+                download_pool.submit(self._do_download, name, url, referer, audio_url)
 
         except Exception as e:
             tb = traceback.format_exc()
@@ -507,16 +652,231 @@ class Handler(BaseHTTPRequestHandler):
             self._cors()
             self._json({'status': 'error', 'msg': str(e)})
 
-    def _do_download(self, name, url, referer):
+    def _do_download(self, name, url, referer, audio_url=''):
         """在单独线程中执行下载"""
         global total_count
         log(f'开始下载: [{name}]')
-        ok = download_one(name, url, referer or None)
+        ok = download_one(name, url, referer or None, audio_url or None)
         with count_lock:
             if ok:
                 total_count += 1
             log(f'--- 任务结束: [{name}] {"成功" if ok else "失败"} (累计: {total_count}) ---')
             log('等待新任务...')
+
+    def _record_live(self, name, url, referer):
+        """循环拉取 M3U8，只下载新片段，直到被 stop"""
+        global live_recording_active, live_recording_count, live_recording_name, live_recording_start
+
+        s = requests.Session()
+        s.trust_env = True
+        ref = referer or derive_referer(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        }
+        if ref:
+            headers['Referer'] = ref
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(ref)
+                headers['Origin'] = f'{p.scheme}://{p.netloc}'
+            except:
+                pass
+        s.headers.update(headers)
+
+        live_recording_count = 0
+        live_recording_name = name
+        live_recording_start = int(time.time())
+        log(f'\n  [LIVE] {name}')
+        log(f'  {"=" * 50}')
+        log(f'  URL: {url[:120]}')
+
+        tmp = os.path.join(OUT, f'live_{int(time.time())}')
+        os.makedirs(tmp, exist_ok=True)
+        seen_urls = set()
+        all_files = {}
+        key = None
+        prev_key_url = None
+        iv = b'\x00' * 16
+
+        try:
+            while not live_stop_event.is_set():
+                # 拉取 M3U8
+                try:
+                    resp = smart_get(s, url, timeout=30)
+                    resp.raise_for_status()
+                except Exception:
+                    try:
+                        resp = s.get(url, timeout=30, proxies={'http': None, 'https': None})
+                        resp.raise_for_status()
+                        s.trust_env = False
+                        log('  已切换直连模式')
+                    except Exception as e:
+                        log(f'  拉取 M3U8 失败: {str(e)[:60]}，5 秒后重试...')
+                        live_stop_event.wait(5)
+                        continue
+
+                m3u8_text = resp.text
+                base = '/'.join(url.split('/')[:-1]) + '/'
+
+                # 解析片段
+                cur_segs = []
+                init_seg = None
+                for line in m3u8_text.split('\n'):
+                    line = line.strip()
+                    if '#EXT-X-MAP:' in line:
+                        um = re.search(r'URI="?([^",]+)"?', line)
+                        if um:
+                            iurl = um.group(1)
+                            init_seg = iurl if iurl.startswith('http') else urljoin(base, iurl)
+                            log(f'  fMP4 初始化段: {init_seg[:100]}')
+                    elif 'URI=' in line and '#EXT-X-KEY' in line:
+                        um = re.search(r'URI="?([^",]+)"?', line)
+                        if um:
+                            kurl = um.group(1)
+                            if not kurl.startswith('http'):
+                                kurl = urljoin(base, kurl)
+                            if kurl != prev_key_url:
+                                try:
+                                    key = smart_get(s, kurl, timeout=15).content
+                                    log(f'  新密钥: {len(key)} 字节')
+                                    prev_key_url = kurl
+                                except:
+                                    pass
+                        iv_s = line.find('IV=0x')
+                        if iv_s != -1:
+                            iv = binascii.unhexlify(line[iv_s + 5:iv_s + 37])
+                    elif line and not line.startswith('#'):
+                        u = line if line.startswith('http') else urljoin(base, line)
+                        cur_segs.append(u)
+
+                # 下载 fMP4 初始化段（首次且未下载过）
+                if init_seg and 'init' not in seen_urls:
+                    seen_urls.add('init')
+                    try:
+                        idata = smart_get(s, init_seg, timeout=30).content
+                        ifp = os.path.join(tmp, 'init.mp4')
+                        with open(ifp, 'wb') as f:
+                            f.write(idata)
+                        all_files[-1] = ifp  # 负数 key 确保排最前面
+                        log(f'  初始化段已下载: {len(idata)} 字节')
+                    except Exception as e:
+                        log(f'  初始化段下载失败: {e}')
+
+                # 下载新片段
+                new_count = 0
+                for seg_url in cur_segs:
+                    if seg_url in seen_urls:
+                        continue
+                    seen_urls.add(seg_url)
+
+                    data = None
+                    for _ in range(3):
+                        try:
+                            data = smart_get(s, seg_url, timeout=60).content
+                            break
+                        except:
+                            time.sleep(1)
+                    # curl_cffi 浏览器伪装兜底
+                    if data is None:
+                        continue
+
+                    # 诊断：打印首个分片的前几个字节
+                    if live_recording_count == 0:
+                        preview = data[:80]
+                        log(f'  首段预览: {preview[:60].hex()} {"..." if len(preview) > 60 else ""} ({"text" if preview[:1].isdigit() or preview[:4].startswith(b"<") or preview[:4].startswith(b"{") else "binary"})')
+
+                    idx = live_recording_count
+                    if key is not None:
+                        seg_iv = iv[:12] + idx.to_bytes(4, 'big')
+                        try:
+                            dec = AES.new(key, AES.MODE_CBC, iv=seg_iv).decrypt(data)
+                            dec = unpad(dec, AES.block_size)
+                        except:
+                            dec = data
+                        data = dec
+
+                    fp = os.path.join(tmp, f's_{idx:05d}.ts')
+                    with open(fp, 'wb') as f:
+                        f.write(data)
+                    all_files[idx] = fp
+                    live_recording_count += 1
+                    new_count += 1
+
+                elapsed = int(time.time()) - live_recording_start
+                log(f'  [{elapsed//60:02d}:{elapsed%60:02d}] +{new_count} 片段 (累计 {live_recording_count})')
+
+                if not live_stop_event.is_set():
+                    live_stop_event.wait(5)
+
+        finally:
+            # 合并
+            if all_files:
+                output = os.path.join(OUT, f'{safe_name(name)}.mp4')
+                # 验证文件
+                valid = {}
+                for idx in sorted(all_files):
+                    fp = all_files[idx]
+                    if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                        valid[idx] = fp
+                all_files = valid
+                if not all_files:
+                    log(f'  [LIVE] 无有效片段')
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    live_recording_active = False
+                    return
+
+                # Python 二进制拼接（兼容 fMP4/TS 所有格式）
+                raw_out = os.path.join(OUT, f'_{safe_name(name)}_raw.mp4')
+                total_bytes = 0
+                with open(raw_out, 'wb') as out:
+                    for idx in sorted(all_files):
+                        with open(all_files[idx], 'rb') as fin:
+                            data = fin.read()
+                            out.write(data)
+                            total_bytes += len(data)
+                log(f'  [LIVE] 拼接完成: {total_bytes} 字节, {len(all_files)} 个文件')
+
+                # 探测编码格式
+                probe = [find_ffmpeg() or 'ffmpeg', '-i', raw_out]
+                p = subprocess.run(probe, capture_output=True, encoding='utf-8',
+                                   errors='replace', timeout=30)
+                has_av1 = 'av1' in (p.stderr or '').lower() or 'av01' in (p.stderr or '').lower()
+
+                if has_av1:
+                    log(f'  [LIVE] 检测到 AV1 编码，转 H.264...')
+                    cmd = [find_ffmpeg() or 'ffmpeg', '-i', raw_out,
+                           '-c:v', 'libx264', '-preset', 'fast',
+                           '-c:a', 'aac', '-movflags', '+faststart', '-y', output]
+                else:
+                    cmd = [find_ffmpeg() or 'ffmpeg', '-i', raw_out,
+                           '-c', 'copy', '-movflags', '+faststart', '-y', output]
+                r = subprocess.run(cmd, capture_output=True, encoding='utf-8',
+                                   errors='replace', timeout=600)
+                if r.returncode != 0:
+                    log(f'  [LIVE] 合并失败，转 H.264 重编...')
+                    cmd2 = [find_ffmpeg() or 'ffmpeg', '-i', raw_out,
+                            '-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast',
+                            '-movflags', '+faststart', '-y', output]
+                    r = subprocess.run(cmd2, capture_output=True, encoding='utf-8',
+                                   errors='replace', timeout=600)
+                if os.path.exists(raw_out):
+                    os.remove(raw_out)
+                if os.path.exists(output):
+                    mb = os.path.getsize(output) / 1048576
+                    log(f'  [LIVE] 录制完成: {mb:.1f} MB -> {output}')
+                else:
+                    log(f'  [LIVE] 合并失败，检查 ffmpeg 是否支持该编码格式')
+            else:
+                log(f'  [LIVE] 无片段，跳过合并')
+
+            shutil.rmtree(tmp, ignore_errors=True)
+            with live_recording_lock:
+                live_recording_active = False
 
     def _cors(self):
         self.send_response(200)
@@ -543,7 +903,11 @@ def main():
         os.environ['HTTPS_PROXY'] = proxy
         os.environ['HTTP_PROXY'] = proxy
 
+    # SO_REUSEADDR: TIME_WAIT 连接残留也能绑定端口
+    import socket as _sk
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer(('127.0.0.1', PORT), Handler)
+    server.socket.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
 
     log('=' * 50)
     log('通用 HLS(M3U8) 视频下载器 启动')
